@@ -1,0 +1,257 @@
+import * as fs from 'node:fs/promises';
+import * as path from 'node:path';
+import * as crypto from 'node:crypto';
+import * as csstree from 'css-tree';
+import type {
+  AssetManifest,
+  DOMNode,
+  DomExtractResult,
+  FontExtractResult,
+  FontFaceRecord,
+  FontFaceSource,
+  TypographyToken,
+} from '../types/index.js';
+
+export async function extractFonts(outputDir: string): Promise<FontExtractResult> {
+  const manifest = await readAssetManifest(outputDir);
+
+  // Index fonts from the manifest so @font-face src URLs can be rewritten.
+  const fontByUrl = new Map<string, { localPath: string }>();
+  for (const [url, record] of Object.entries(manifest)) {
+    if (record.type === 'font') fontByUrl.set(url, { localPath: record.localPath });
+  }
+
+  // Parse every captured CSS file for @font-face blocks.
+  const faces: FontFaceRecord[] = [];
+  const seenFaceKeys = new Set<string>();
+  for (const [cssUrl, record] of Object.entries(manifest)) {
+    if (record.type !== 'css') continue;
+    const abs = path.join(outputDir, record.localPath);
+    let cssText: string;
+    try {
+      cssText = await fs.readFile(abs, 'utf8');
+    } catch {
+      continue;
+    }
+    for (const face of parseFontFaces(cssText, cssUrl, fontByUrl)) {
+      const key = faceKey(face);
+      if (seenFaceKeys.has(key)) continue;
+      seenFaceKeys.add(key);
+      faces.push(face);
+    }
+  }
+
+  // Walk dom-tree.json (if present) for actual typography combinations.
+  const tokens = await collectTypographyTokens(outputDir);
+
+  const fontsCssPath = path.join(outputDir, 'fonts.css');
+  await fs.writeFile(fontsCssPath, renderFontsCss(faces));
+
+  const tokensJsonPath = path.join(outputDir, 'typography-tokens.json');
+  await fs.writeFile(tokensJsonPath, JSON.stringify({ tokens }, null, 2));
+
+  return { faces, tokens, fontsCssPath, tokensJsonPath };
+}
+
+async function readAssetManifest(outputDir: string): Promise<AssetManifest> {
+  const p = path.join(outputDir, 'assets', 'manifest.json');
+  try {
+    return JSON.parse(await fs.readFile(p, 'utf8')) as AssetManifest;
+  } catch {
+    return {};
+  }
+}
+
+function faceKey(f: FontFaceRecord): string {
+  return `${f.family}|${f.weight ?? ''}|${f.style ?? ''}|${f.stretch ?? ''}|${f.unicodeRange ?? ''}`;
+}
+
+function parseFontFaces(
+  cssText: string,
+  cssSourceUrl: string,
+  fontByUrl: Map<string, { localPath: string }>,
+): FontFaceRecord[] {
+  let ast: csstree.CssNode;
+  try {
+    ast = csstree.parse(cssText);
+  } catch {
+    return [];
+  }
+
+  const faces: FontFaceRecord[] = [];
+
+  csstree.walk(ast, {
+    visit: 'Atrule',
+    enter(node) {
+      if (node.name !== 'font-face' || !node.block) return;
+
+      const decls: Record<string, string> = {};
+      csstree.walk(node.block, {
+        visit: 'Declaration',
+        enter(decl) {
+          decls[decl.property.toLowerCase()] = csstree.generate(decl.value).trim();
+        },
+      });
+
+      const rawFamily = decls['font-family'];
+      if (!rawFamily) return;
+      const family = unquote(rawFamily);
+      const weight = decls['font-weight'];
+      const style = decls['font-style'];
+      const stretch = decls['font-stretch'];
+      const display = decls['font-display'];
+      const unicodeRange = decls['unicode-range'];
+      const srcValue = decls['src'] ?? '';
+      const hasVariationSettings = 'font-variation-settings' in decls;
+
+      const sources = parseSrc(srcValue, cssSourceUrl, fontByUrl);
+
+      const variable =
+        hasVariationSettings ||
+        /\s/.test((weight ?? '').trim()) ||
+        /\s/.test((stretch ?? '').trim()) ||
+        sources.some((s) => (s.format ?? '').includes('variations'));
+
+      faces.push({
+        family,
+        weight,
+        style,
+        stretch,
+        display,
+        unicodeRange,
+        variable,
+        sources,
+      });
+    },
+  });
+
+  return faces;
+}
+
+const URL_FORMAT_RE =
+  /url\(\s*(['"]?)([^'")]+)\1\s*\)(?:\s*format\(\s*(['"]?)([^'")]+)\3\s*\))?/g;
+
+function parseSrc(
+  srcValue: string,
+  cssSourceUrl: string,
+  fontByUrl: Map<string, { localPath: string }>,
+): FontFaceSource[] {
+  const sources: FontFaceSource[] = [];
+  for (const match of srcValue.matchAll(URL_FORMAT_RE)) {
+    const rawUrl = match[2];
+    const format = match[4];
+    if (!rawUrl || rawUrl.startsWith('data:')) continue;
+
+    let absoluteUrl: string | undefined;
+    try {
+      absoluteUrl = new URL(rawUrl, cssSourceUrl).toString();
+    } catch {
+      absoluteUrl = rawUrl;
+    }
+    const hit = absoluteUrl ? fontByUrl.get(absoluteUrl) : undefined;
+    sources.push({
+      originalUrl: absoluteUrl,
+      localPath: hit?.localPath,
+      format,
+    });
+  }
+  return sources;
+}
+
+function unquote(s: string): string {
+  const trimmed = s.trim();
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function renderFontsCss(faces: FontFaceRecord[]): string {
+  const lines: string[] = [
+    '/* Generated by framer-extract — @font-face rules with rewritten local paths */',
+    '',
+  ];
+  for (const face of faces) {
+    lines.push('@font-face {');
+    lines.push(`  font-family: "${face.family}";`);
+    if (face.style) lines.push(`  font-style: ${face.style};`);
+    if (face.weight) lines.push(`  font-weight: ${face.weight};`);
+    if (face.stretch) lines.push(`  font-stretch: ${face.stretch};`);
+    if (face.display) lines.push(`  font-display: ${face.display};`);
+    if (face.unicodeRange) lines.push(`  unicode-range: ${face.unicodeRange};`);
+    const srcParts: string[] = [];
+    for (const s of face.sources) {
+      const href = s.localPath ? `./${s.localPath.replace(/\\/g, '/')}` : s.originalUrl;
+      if (!href) continue;
+      const piece = s.format ? `url("${href}") format("${s.format}")` : `url("${href}")`;
+      srcParts.push(piece);
+    }
+    if (srcParts.length > 0) {
+      lines.push(`  src: ${srcParts.join(', ')};`);
+    }
+    lines.push('}');
+    lines.push('');
+  }
+  return lines.join('\n');
+}
+
+async function collectTypographyTokens(outputDir: string): Promise<TypographyToken[]> {
+  const treePath = path.join(outputDir, 'dom-tree.json');
+  let data: DomExtractResult;
+  try {
+    data = JSON.parse(await fs.readFile(treePath, 'utf8')) as DomExtractResult;
+  } catch {
+    return [];
+  }
+
+  const combos = new Map<string, TypographyToken>();
+
+  function visit(node: DOMNode): void {
+    if (hasRenderedText(node)) {
+      const cs = node.computedStyle;
+      const combo = {
+        fontFamily: cs['font-family'] ?? '',
+        fontWeight: cs['font-weight'] ?? '',
+        fontSize: cs['font-size'] ?? '',
+        lineHeight: cs['line-height'] ?? '',
+        letterSpacing: cs['letter-spacing'] ?? '',
+      };
+      if (combo.fontFamily) {
+        const id = crypto
+          .createHash('sha1')
+          .update(JSON.stringify(combo))
+          .digest('hex')
+          .slice(0, 10);
+        const existing = combos.get(id);
+        if (existing) {
+          existing.count += 1;
+        } else {
+          combos.set(id, {
+            id,
+            ...combo,
+            count: 1,
+            sampleText: node.text?.slice(0, 80),
+          });
+        }
+      }
+    }
+    for (const child of node.children) visit(child);
+  }
+
+  visit(data.tree);
+  return [...combos.values()].sort((a, b) => b.count - a.count);
+}
+
+const TEXT_TAGS = new Set([
+  'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+  'p', 'span', 'a', 'button', 'li', 'td', 'th',
+  'label', 'strong', 'em', 'small', 'blockquote', 'figcaption',
+]);
+
+function hasRenderedText(node: DOMNode): boolean {
+  if (node.text && node.text.trim().length > 0) return true;
+  return TEXT_TAGS.has(node.tag);
+}
