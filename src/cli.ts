@@ -2,36 +2,45 @@
 import { Command } from 'commander';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { interceptAssets } from './extractor/asset-interceptor.js';
-import { extractDom } from './extractor/dom-extractor.js';
-import { recordAnimations } from './extractor/animation-recorder.js';
-import { extractFonts } from './extractor/font-extractor.js';
-import { generateReactApp, type GeneratorFormat } from './generator/react-generator.js';
-
-interface CliOptions {
-  output: string;
-  debug: boolean;
-  format: GeneratorFormat;
-}
+import { captureForRebuild } from './visual-rebuild/index.js';
+import { identifySections } from './visual-rebuild/agents/section-identifier.js';
+import { generateComponents } from './visual-rebuild/agents/component-generator.js';
+import { assembleProject } from './visual-rebuild/agents/page-assembler.js';
+import { runVisualQA } from './visual-rebuild/agents/visual-qa.js';
 
 const program = new Command();
 
 program
   .name('framer-extract')
-  .description('Extract and regenerate code from a Framer site')
-  .version('0.1.0')
-  .argument('<url>', 'Framer site URL to extract')
+  .description('Rebuild websites from screenshots using Claude vision')
+  .version('0.1.0');
+
+// Rebuild command (default)
+program
+  .command('rebuild', { isDefault: true })
+  .description('Rebuild a website from screenshots using Claude vision')
+  .argument('<url>', 'URL to capture and rebuild')
   .option('-o, --output <dir>', 'Output directory', './output')
-  .option('--debug', 'Keep intermediate JSON files in the output directory', false)
-  .option('--format <format>', 'Project scaffold format: "vite" or "nextjs"', 'vite')
-  .action(async (url: string, rawOptions: { output: string; debug: boolean; format: string }) => {
-    const options: CliOptions = {
+  .option('--debug', 'Keep intermediate files (screenshots, sections.json, qa reports)', false)
+  .option('--skip-qa', 'Skip the visual QA refinement loop', false)
+  .option('--sections <names>', 'Only regenerate specific sections (comma-separated)', '')
+  .option('--model <model>', 'Claude model to use', 'claude-sonnet-4-20250514')
+  .action(async (url: string, rawOptions: {
+    output: string;
+    debug: boolean;
+    skipQa: boolean;
+    sections: string;
+    model: string;
+  }) => {
+    await runRebuild(url, {
       output: path.resolve(rawOptions.output),
       debug: rawOptions.debug,
-      format: validateFormat(rawOptions.format),
-    };
-
-    await run(url, options);
+      skipQa: rawOptions.skipQa,
+      sections: rawOptions.sections
+        ? rawOptions.sections.split(',').map((s) => s.trim()).filter(Boolean)
+        : [],
+      model: rawOptions.model,
+    });
   });
 
 program.parseAsync(process.argv).catch((err) => {
@@ -39,70 +48,152 @@ program.parseAsync(process.argv).catch((err) => {
   process.exitCode = 1;
 });
 
-function validateFormat(value: string): GeneratorFormat {
-  if (value === 'vite' || value === 'nextjs') return value;
-  throw new Error(`Invalid --format "${value}" — expected "vite" or "nextjs"`);
+interface RebuildOptions {
+  output: string;
+  debug: boolean;
+  skipQa: boolean;
+  sections: string[];
+  model: string;
 }
 
-async function run(url: string, options: CliOptions): Promise<void> {
+async function runRebuild(url: string, options: RebuildOptions): Promise<void> {
   try {
     new URL(url);
   } catch {
     throw new Error(`Invalid URL: ${url}`);
   }
 
+  const { output: outputDir, model } = options;
   const started = Date.now();
-  console.log(`→ framer-extract`);
-  console.log(`  url:    ${url}`);
-  console.log(`  output: ${options.output}`);
-  console.log(`  format: ${options.format}`);
-  console.log(`  debug:  ${options.debug}`);
+
+  console.log(`→ framer-extract rebuild`);
+  console.log(`  url:      ${url}`);
+  console.log(`  output:   ${outputDir}`);
+  console.log(`  model:    ${model}`);
+  console.log(`  skip-qa:  ${options.skipQa}`);
+  if (options.sections.length > 0) {
+    console.log(`  sections: ${options.sections.join(', ')}`);
+  }
+  console.log(`  debug:    ${options.debug}`);
   console.log();
 
-  await fs.mkdir(options.output, { recursive: true });
+  await fs.mkdir(outputDir, { recursive: true });
 
-  await step('Intercepting network assets', async () => {
-    const result = await interceptAssets(url, options.output);
-    const count = Object.keys(result.manifest).length;
-    return `${count} asset${count === 1 ? '' : 's'} saved`;
-  });
-
-  await step('Extracting DOM tree and computed styles', async () => {
-    const result = await extractDom(url, options.output);
-    return `tree rooted at <${result.tree.tag}> across ${Object.keys(result.viewports).length} viewports`;
-  });
-
-  await step('Recording animations', async () => {
-    const result = await recordAnimations(url, options.output);
+  // ---- Step 1: Capture ----
+  await step('Capturing screenshots, text, and assets', async () => {
+    const result = await captureForRebuild(url, outputDir);
     const parts = [
-      `${Object.keys(result.keyframes).length} @keyframes`,
-      `${result.webAnimations.length} WAAPI calls`,
-      `${result.hoverStates.length} hover states`,
+      `${result.screenshots.length} screenshots`,
+      `${result.assetCount} assets`,
     ];
+    if (result.errors.length > 0) {
+      parts.push(`${result.errors.length} error${result.errors.length === 1 ? '' : 's'}`);
+    }
     return parts.join(', ');
   });
 
-  await step('Extracting fonts and typography tokens', async () => {
-    const result = await extractFonts(options.output);
-    return `${result.faces.length} @font-face, ${result.tokens.length} typography tokens`;
+  // ---- Step 2: Identify sections ----
+  const sectionResult = await step2('Identifying page sections', async () => {
+    const result = await identifySections(outputDir, model);
+    const names = result.sections.map((s) => s.name).join(', ');
+    return {
+      detail: `${result.sections.length} sections (${names})`,
+      value: result,
+    };
   });
 
-  await step(`Generating React app (${options.format})`, async () => {
-    await generateReactApp(options.output, { format: options.format });
-    return 'src/, public/, package.json written';
+  // ---- Step 3: Generate components ----
+  const genResult = await step2('Generating React components', async () => {
+    const sectionsToGen = options.sections.length > 0 ? options.sections : undefined;
+    const result = await generateComponents(outputDir, {
+      model,
+      filterSections: sectionsToGen,
+    });
+    const parts = [`${result.components.length} components`];
+    if (result.errors.length > 0) {
+      parts.push(`${result.errors.length} failed`);
+    }
+    return {
+      detail: parts.join(', '),
+      value: result,
+    };
   });
 
+  // ---- Step 4: Assemble project ----
+  await step('Assembling Vite + React + Tailwind project', async () => {
+    const result = await assembleProject(outputDir, genResult.components, model);
+    const parts = [
+      `${result.files.length} files`,
+      `${Object.keys(result.brandColors).length} brand colors`,
+    ];
+    if (result.fontFamilies.length > 0) {
+      parts.push(`${result.fontFamilies.length} font families`);
+    }
+    return parts.join(', ');
+  });
+
+  // ---- Step 5: Visual QA ----
+  if (!options.skipQa) {
+    await step('Running visual QA loop', async () => {
+      const result = await runVisualQA(outputDir, model);
+      const status = result.converged ? 'converged' : `stopped after ${result.iterations.length} iterations`;
+      return `${result.totalFixesApplied} fixes applied, ${status}`;
+    });
+  }
+
+  // ---- Step 6: Clean up intermediates ----
   if (!options.debug) {
     await step('Cleaning intermediate files', async () => {
-      const removed = await cleanIntermediates(options.output);
-      return `removed ${removed.length} file${removed.length === 1 ? '' : 's'}`;
+      const targets = [
+        'sections.json',
+        'content.txt',
+        'qa-report.json',
+      ];
+      let removed = 0;
+      for (const rel of targets) {
+        try {
+          await fs.unlink(path.join(outputDir, rel));
+          removed++;
+        } catch {
+          // missing — ignore
+        }
+      }
+      // Remove QA iteration screenshots
+      const screenshotsDir = path.join(outputDir, 'screenshots');
+      try {
+        const entries = await fs.readdir(screenshotsDir);
+        for (const entry of entries) {
+          if (entry.startsWith('qa-iteration-')) {
+            await fs.rm(path.join(screenshotsDir, entry), { recursive: true });
+            removed++;
+          }
+        }
+      } catch {
+        // missing — ignore
+      }
+      return `removed ${removed} intermediate${removed === 1 ? '' : 's'}`;
     });
   }
 
   const seconds = ((Date.now() - started) / 1000).toFixed(1);
   console.log();
-  console.log(`✓ Done in ${seconds}s`);
-  console.log(`  Next: cd ${options.output} && npm install && npm run dev`);
+  console.log(`✓ Rebuild complete in ${seconds}s`);
+  console.log(`  Project: ${outputDir}/`);
+  console.log(`  Next:    cd ${outputDir} && npm install && npm run dev`);
+
+  if (genResult.errors.length > 0) {
+    console.log();
+    console.log(`  Warnings:`);
+    for (const err of genResult.errors) {
+      console.log(`    - ${err.section}: ${err.error}`);
+    }
+  }
+  if (sectionResult.sections.length > 0 && options.sections.length > 0) {
+    const skipped = sectionResult.sections.length - genResult.components.length;
+    if (skipped > 0) {
+      console.log(`  (${skipped} section${skipped === 1 ? '' : 's'} skipped due to --sections filter)`);
+    }
+  }
 }
 
 async function step(label: string, fn: () => Promise<string>): Promise<void> {
@@ -118,17 +209,19 @@ async function step(label: string, fn: () => Promise<string>): Promise<void> {
   }
 }
 
-async function cleanIntermediates(outputDir: string): Promise<string[]> {
-  const targets = ['dom-tree.json', 'animations.json', 'assets/manifest.json'];
-  const removed: string[] = [];
-  for (const rel of targets) {
-    const abs = path.join(outputDir, rel);
-    try {
-      await fs.unlink(abs);
-      removed.push(rel);
-    } catch {
-      // missing — ignore
-    }
+async function step2<T>(
+  label: string,
+  fn: () => Promise<{ detail: string; value: T }>,
+): Promise<T> {
+  const start = Date.now();
+  process.stdout.write(`• ${label}… `);
+  try {
+    const { detail, value } = await fn();
+    const ms = Date.now() - start;
+    process.stdout.write(`done (${detail}, ${ms}ms)\n`);
+    return value;
+  } catch (err) {
+    process.stdout.write(`failed\n`);
+    throw err;
   }
-  return removed;
 }
